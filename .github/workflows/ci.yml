@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 注意：真实的端到端测试（scripts/test_*.py、quick_plot.py）需要
+# Windows + 本机安装 OriginLab Origin（COM 自动化仅限 Windows），
+# GitHub 的 Linux/macOS runner 跑不了。这里只做「能跨平台、无需依赖」
+# 的静态校验：Python 语法编译 + Skill frontmatter 完整性。
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check (all .py)
+        run: |
+          python -m compileall -q origin-mcp origin-auto-skill
+          echo "All Python files compile OK"
+
+      - name: Validate skill frontmatter
+        run: |
+          python - <<'PY'
+          p = "origin-auto-skill/SKILL.md"
+          txt = open(p, encoding="utf-8").read()
+          assert "name:" in txt, "SKILL.md 缺少 name: 字段"
+          print("SKILL.md frontmatter OK")
+          PY
+
+      - name: Ensure no stray large/binary files tracked
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              ["git", "ls-files"], capture_output=True, text=True
+          ).stdout.splitlines()
+          banned = (".opju", ".png", ".pptx", ".html", ".pdf", ".zip", ".exe")
+          bad = [f for f in out if f.lower().endswith(banned)]
+          if bad:
+              print("发现不应纳入仓库的二进制文件:", bad)
+              sys.exit(1)
+          print("无意外二进制文件，OK")
+          PY

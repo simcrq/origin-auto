@@ -1,0 +1,8 @@
+# 统一仓库内文本文件的行尾为 LF，避免 Windows / 跨平台协作时的 CRLF 噪声
+* text=auto eol=lf
+
+# 二进制文件（正常不应纳入，仅作保险）
+*.opju binary
+*.png binary
+*.pdf binary
+*.pptx binary
