@@ -1,0 +1,19 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ===== 测试输出（二进制 / 临时） =====
+**/test_output/
+
+# ===== Origin 软件目录（非项目代码） =====
+Origin/
+
+# ===== OS / 编辑器临时文件 =====
+*.tmp
+~$*
+.DS_Store
+Thumbs.db
