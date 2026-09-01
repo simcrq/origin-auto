@@ -57,6 +57,8 @@ import time
 from datetime import datetime
 import concurrent.futures
 from pathlib import Path
+import csv
+import json
 
 try:
     import winreg
@@ -222,6 +224,35 @@ def _is_nanum(v) -> bool:
     # 必须按相对误差精确匹配哨兵：用绝对容差会把正常的 0.0 误判成哨兵
     # （实测活动窗口是工作簿时 layer.y.from 读到的正是 0.0）
     return f < 0 and abs(f - _NANUM) <= abs(_NANUM) * 1e-6
+
+
+def _coerce_cell(v):
+    """把单元格值尽量转成数值，避免把数字当字符串写入 Origin 后被存成文本。
+
+    文本 bug 会导致 col(1)[1]=NANUM、坐标轴范围塌成 0-0.2。规则：
+    - None / 空串 -> None（PutWorksheet 会当缺失）
+    - bool -> 原样（避免被 float(True)=1.0 改写）
+    - int/float -> 原样
+    - str -> 去掉首尾空白后尝试转 float；纯整型且范围合理转 int，否则保留文本
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return None
+        try:
+            f = float(s)
+        except ValueError:
+            return v  # 真非数值 -> 保留文本
+        if f.is_integer() and abs(f) < 1e15:
+            return int(f)
+        return f
+    return v
 
 
 # 单次 PutWorksheet 的行数上限；超过则分块（实测整块 68804x20 约 0.4s，
@@ -726,6 +757,16 @@ class OriginSession:
             return {"ok": False, "error": "data 为空"}
         rows = len(data)
         ncols = max(len(r) for r in data)
+        # 数值强转：避免把数字当字符串写入 Origin（否则整列变文本、轴塌成 0-0.2）
+        data = [[_coerce_cell(v) for v in row] for row in data]
+        # 判定每列是否全数值，仅对数值列预格式化，避免误伤文本列（如标签列）
+        col_is_num = [True] * ncols
+        for row in data:
+            for ci, v in enumerate(row):
+                if ci >= ncols:
+                    break
+                if v is not None and not isinstance(v, (int, float, bool)):
+                    col_is_num[ci] = False
         # 关键：用户可能传的是未净化的名字（Data_0.6），解析成实际窗口（Data06）
         bk = self._resolve_page(book, "worksheet")
         need_cols = start_col - 1 + ncols
@@ -736,6 +777,9 @@ class OriginSession:
             # 关键：只扩不缩——无脑赋值 wks.nrows 会截掉已有数据（实测教训）
             f"if(wks.nrows < {max(need_rows, 1)}) wks.nrows = {max(need_rows, 1)};",
         ]
+        for ci in range(ncols):
+            if col_is_num[ci]:
+                pre.append(f"wks.col({ci + 1}).numerictype = 0;")
         if header:
             for j, h in enumerate(header):
                 i = start_col + j
@@ -861,6 +905,205 @@ class OriginSession:
             _csv.writer(f).writerows(r["data"])
         return {"ok": True, "path": str(p), "rows": r.get("rows")}
 
+    # -- 通用导入（领域无关，配套溯源） --------------------------------------
+
+    def import_csv(self, path: str, book_name: str | None = None,
+                   x_col: int = 1, y_cols: list[int] | None = None,
+                   provenance: str | None = None) -> dict:
+        """领域无关的 CSV 导入：把任意 CSV 读入新工作簿。
+
+        - 表头作为列 long-name；可选 x_col/y_cols 指定 X/Y 列 designation。
+        - provenance 字符串会盖进工作簿 comment（page.info(8)，best-effort），
+          同时返回供上游记录。外部预处理（单位/平滑/拆分）不在此做。
+        - 数值列经 _coerce_cell 自动转数值，配合 data_put 的 numerictype
+          预格式化，避免整列被存成文本。
+        返回实际工作簿名、行列数、provenance。"""
+        p = Path(_bsl(path))
+        if not p.exists():
+            return {"ok": False, "error": f"找不到文件: {path}"}
+        with open(p, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return {"ok": False, "error": "CSV 为空"}
+        header = [c.strip() for c in rows[0]]
+        body = rows[1:]
+        ncols = max(len(r) for r in rows)
+        header = (header + [""] * (ncols - len(header)))[:ncols]
+        data = [[_coerce_cell(v) for v in r] for r in body]  # 数值强转
+        if not data:
+            return {"ok": False, "error": "CSV 无数据行"}
+        base = book_name or p.stem
+        r_bk = self.workbook_new(base)
+        if not r_bk.get("ok"):
+            return {"ok": False, "error": r_bk.get("error", "建簿失败")}
+        bk = r_bk["book"]
+        r_put = self.data_put(bk, data, header=header)
+        # 指定 X/Y designation
+        cols_meta = []
+        for i in range(1, ncols + 1):
+            if i == x_col:
+                cols_meta.append({"index": i, "type": "x",
+                                  "name": header[i - 1] or f"X{i}"})
+            elif y_cols is None or i in y_cols:
+                cols_meta.append({"index": i, "type": "y",
+                                  "name": header[i - 1] or f"Y{i}"})
+            else:
+                cols_meta.append({"index": i, "name": header[i - 1] or f"C{i}"})
+        self.worksheet_set_columns(bk, cols_meta)
+        # 溯源戳记（best-effort，不影响导入成败）
+        prov = provenance or f"source={p.name}"
+        try:
+            self.ex(f'win -a {bk}; page.info(8)$ = "{_clean_text(prov)}";')
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "book": bk, "rows": len(data), "cols": ncols,
+                "header": header, "provenance": prov,
+                "write_method": r_put.get("method")}
+
+    def import_dataset(self, manifest_path: str) -> dict:
+        """按 manifest.json 批量导入数据集，并写 import_log.json 溯源。
+
+        领域无关。manifest 结构示例：
+        {
+          "name": "8.27 carbon",
+          "description": "拉拔力-位移，单位已转 N，窗长500平滑",
+          "items": [
+            {"csv": "processed/x.csv", "book_name": "X1",
+             "x_col": 1, "y_cols": [2], "provenance": "smooth window=500 step=1"},
+            ...
+          ]
+        }
+        每个 item 调 import_csv；完成后在 manifest 同目录写 import_log.json：
+        {book: {source, provenance, imported_at}}，作为可复盘审计链。
+        返回每次导入结果列表与日志路径。"""
+        mp = Path(_bsl(manifest_path))
+        if not mp.exists():
+            return {"ok": False, "error": f"找不到 manifest: {manifest_path}"}
+        try:
+            manifest = json.loads(mp.read_text(encoding="utf-8-sig"))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"manifest 解析失败: {exc}"}
+        items = manifest.get("items")
+        if not isinstance(items, list) or not items:
+            return {"ok": False, "error": "manifest.items 为空或非列表"}
+        results: list[dict] = []
+        log_map: dict = {}
+        base_dir = mp.parent
+        for it in items:
+            csv_path = it.get("csv")
+            if not csv_path:
+                results.append({"ok": False, "error": "item 缺少 csv 字段",
+                                "item": it})
+                continue
+            cp = Path(csv_path)
+            if not cp.is_absolute():
+                cp = base_dir / cp
+            prov = it.get("provenance") or manifest.get("description") or ""
+            r = self.import_csv(
+                str(cp),
+                book_name=it.get("book_name"),
+                x_col=int(it.get("x_col", 1)),
+                y_cols=it.get("y_cols"),
+                provenance=prov)
+            results.append(r)
+            if r.get("ok"):
+                log_map[r["book"]] = {
+                    "source": str(cp),
+                    "provenance": prov,
+                    "imported_at": datetime.now().isoformat(timespec="seconds"),
+                }
+        log_path = base_dir / "import_log.json"
+        try:
+            log_path.write_text(
+                json.dumps({"dataset": manifest.get("name"), "log": log_map},
+                          ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            log_written = str(log_path)
+        except Exception as exc:  # noqa: BLE001
+            log_written = None
+            log.warning("import_log 写入失败: %s", exc)
+        ok_count = sum(1 for r in results if r.get("ok"))
+        return {"ok": ok_count == len(results), "imported": ok_count,
+                "total": len(results), "results": results,
+                "import_log": log_written}
+
+    # -- 绘图对齐（通用，可选） ------------------------------------------------
+
+    @staticmethod
+    def _interp(xs, ys, xq):
+        """单调 xs 上的线性插值；越界取端点。"""
+        if not xs:
+            return 0.0
+        if xq <= xs[0]:
+            return ys[0]
+        if xq >= xs[-1]:
+            return ys[-1]
+        lo, hi = 0, len(xs) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xs[mid] <= xq:
+                lo = mid
+            else:
+                hi = mid
+        t = (xq - xs[lo]) / (xs[hi] - xs[lo]) if xs[hi] != xs[lo] else 0.0
+        return ys[lo] + t * (ys[hi] - ys[lo])
+
+    def _min_spacing(self, series_xs):
+        best = None
+        for xs in series_xs:
+            for a, b in zip(xs, xs[1:]):
+                d = b - a
+                if d > 0 and (best is None or d < best):
+                    best = d
+        return best
+
+    def _build_aligned_book(self, book, x_col, y_cols, grid_step):
+        """偏置到 (0,0) + 插值到公共 X 网格，写入新工作簿。
+
+        返回 (book, xmax, ncols)。多曲线 X 范围不一致、需画同一图时调用
+        （与领域无关）。"""
+        r = self.worksheet_get_data(book)
+        if not r.get("ok"):
+            return None, 0.0, 0
+        data = r.get("data", [])
+        if not data:
+            return None, 0.0, 0
+        ncols = max(len(row) for row in data)
+        cols = [[_coerce_cell(row[c]) if c < len(row) else None
+                 for row in data] for c in range(ncols)]
+        xc = cols[x_col - 1]
+        yidx = y_cols or [i for i in range(1, ncols + 1) if i != x_col]
+        series = []
+        for y in yidx:
+            xs = cols[y - 1]
+            if not xs:
+                continue
+            x0, y0 = xc[0], xs[0]
+            series.append(([x - x0 for x in xc], [yv - y0 for yv in xs]))
+        if not series:
+            return None, 0.0, 0
+        all_min = min(min(xs) for xs, _ in series)
+        all_max = max(max(xs) for xs, _ in series)
+        step = grid_step or self._min_spacing([xs for xs, _ in series]) or 0.01
+        grid = [all_min + i * step for i in range(int((all_max - all_min) / step) + 1)]
+        out_cols = [grid]
+        for xs, ys in series:
+            out_cols.append([self._interp(xs, ys, g) for g in grid])
+        nrows = len(grid)
+        rows = [[(out_cols[c][r] if r < len(out_cols[c]) else None)
+                 for c in range(len(out_cols))] for r in range(nrows)]
+        r_bk = self.workbook_new(f"{_sanitize_page_name(book)}_align")
+        if not r_bk.get("ok"):
+            return None, 0.0, 0
+        bk = r_bk["book"]
+        self.data_put(bk, rows,
+                      header=["X"] + [f"Y{i}" for i in range(1, len(out_cols))])
+        meta = [{"index": 1, "type": "x", "name": "X"}]
+        for i in range(2, len(out_cols) + 1):
+            meta.append({"index": i, "type": "y", "name": f"Y{i-1}"})
+        self.worksheet_set_columns(bk, meta)
+        return bk, all_max, len(out_cols)
+
     # -- 绘图 ---------------------------------------------------------------
 
     def plot_create(self, book: str, x_col: int = 1,
@@ -869,12 +1112,54 @@ class OriginSession:
                     template: str | None = None,
                     graph_name: str | None = None,
                     pairs: list[list[int]] | None = None,
-                    err_cols: list[int | None] | None = None) -> dict:
+                    err_cols: list[int | None] | None = None,
+                    offset_origin: bool = False,
+                    shared_x_grid: bool = False,
+                    line_width: float | None = None,
+                    ref_step: float | None = None,
+                    ref_axis: str = "x",
+                    ref_dash: bool = True,
+                    ref_color: int = 1,
+                    ref_width: float = 1.0,
+                    grid_step: float | None = None) -> dict:
         """实测：plotxy 多 Y 仅支持连续列区间 iy:=(x,(a:b))；
         非连续列的追加语法（ogl:=[G]1 / layer -i 等）在 COM 下均无效。
         因此非连续列自动拆分为多个图，并在返回值中说明。
         pairs=[[1,2],[3,4],...] 时按显式 XY 对绘制（各 X 列可独立），
-        实测 iy:=((1,2),(3,4)) 语法有效且曲线数正确。"""
+        实测 iy:=((1,2),(3,4)) 语法有效且曲线数正确。
+
+        通用对齐（可选，与领域无关，不替代外部数据处理）：
+        - offset_origin：所有曲线偏置到 (0,0)（减各自首点）。
+        - shared_x_grid：多曲线 X 范围不一致时，插值到公共 X 网格再画
+          （否则 plotxy 多 Y 共用 X 列会把轴拉崩）。offset_origin 时默认
+          也走公共网格。grid_step 可指定网格分辨率（默认取最小间距或 0.01）。
+        - line_width：统一设曲线宽度(pt)。
+        - ref_step：沿 ref_axis 以该步长画参考虚线（如 x=2,4,6...）。"""
+        # 对齐预处理：偏置 + 公共 X 网格，写入新簿后复用既有绘图逻辑
+        if (offset_origin or shared_x_grid) and not pairs:
+            aligned_bk, xmax, ncols = self._build_aligned_book(
+                book, x_col, y_cols, grid_step)
+            if not aligned_bk:
+                return {"ok": False, "error": "对齐预处理失败（读取/建簿出错）"}
+            y_cols = list(range(2, ncols + 1)) if ncols > 1 else None
+            res = self.plot_create(
+                aligned_bk, x_col=1, y_cols=y_cols, plot_type=plot_type,
+                template=template, graph_name=graph_name, pairs=None,
+                err_cols=None, offset_origin=False, shared_x_grid=False)
+            graph = res.get("graph")
+            if graph and (line_width is not None or ref_step is not None):
+                if line_width is not None and y_cols:
+                    for yc in y_cols:
+                        self.series_style(graph=graph, y_col=yc,
+                                          line_width_pt=line_width)
+                if ref_step is not None:
+                    for xv in range(int(ref_step), int(xmax) + 1, int(ref_step)):
+                        self.add_ref_line(graph=graph, axis=ref_axis,
+                                          pos=float(xv), color=ref_color,
+                                          width=ref_width, dash=ref_dash)
+            res["aligned_book"] = aligned_bk
+            res["xmax"] = xmax
+            return res
         ys = sorted(set(int(v) for v in (y_cols or [2])))
         if isinstance(plot_type, int):
             pid, key = plot_type, None
@@ -1670,6 +1955,31 @@ def data_put(book: str, data: list[list], start_row: int = 1,
 
 
 @mcp.tool()
+def import_csv(path: str, book_name: str | None = None,
+               x_col: int = 1, y_cols: list[int] | None = None,
+               provenance: str | None = None) -> dict:
+    """领域无关地导入任意 CSV 到新工作簿：表头→列名，可指定 X/Y 列。
+
+    provenance 字符串会盖进工作簿 comment 并随结果返回，用于溯源。
+    数值列经自动强转 + numerictype 预格式化，避免整列被存成文本。
+    返回实际工作簿名、行列数、provenance。重数据处理请在外部完成。"""
+    session.ensure_connected()
+    return session.import_csv(path=path, book_name=book_name, x_col=x_col,
+                              y_cols=y_cols, provenance=provenance)
+
+
+@mcp.tool()
+def import_dataset(manifest_path: str) -> dict:
+    """按 manifest.json 批量导入数据集并写 import_log.json 溯源（领域无关）。
+
+    manifest.items[] 每项：{csv, book_name?, x_col?, y_cols?, provenance?}；
+    csv 路径相对 manifest 目录解析。完成后在同目录写 import_log.json
+    （{book: {source, provenance, imported_at}}）作为可复盘审计链。"""
+    session.ensure_connected()
+    return session.import_dataset(manifest_path=manifest_path)
+
+
+@mcp.tool()
 def worksheet_get_data(book: str) -> dict:
     """读回工作簿活动表的全部数据（用于核对写入结果或分析）。"""
     session.ensure_connected()
@@ -1681,19 +1991,35 @@ def plot_create(book: str, x_col: int = 1, y_cols: list[int] | None = None,
                 plot_type: str | int = "line_symbol",
                 template: str | None = None, graph_name: str | None = None,
                 pairs: list[list[int]] | None = None,
-                err_cols: list[int | None] | None = None) -> dict:
+                err_cols: list[int | None] | None = None,
+                offset_origin: bool = False, shared_x_grid: bool = False,
+                line_width: float | None = None, ref_step: float | None = None,
+                ref_axis: str = "x", ref_dash: bool = True, ref_color: int = 1,
+                ref_width: float = 1.0, grid_step: float | None = None) -> dict:
     """从工作簿数据创建折线/散点/点线/柱状图到新 Graph 窗口。
     plot_type 可选 line/scatter/line_symbol/column/bar 或 plotxy 整数 ID；
     共用 X 列时用 y_cols（需相邻），各 X 独立时用 pairs=[[x1,y1],[x2,y2],...]。
     err_cols 与 pairs 对应（元素可为 null）：给出误差列号时该对以选区方式
     绘制并自动加 Y 误差棒（误差列需已用 worksheet_set_columns 设为 yerr）。
     返回的 graph 是回读到的**实际**窗口名（Origin 会净化图形名），曲线数已核对；
-    若图形已生成但图层对象取不到，ok 仍为 True 并附 note。"""
+    若图形已生成但图层对象取不到，ok 仍为 True 并附 note。
+
+    通用对齐（可选，与领域无关，不替代外部数据处理）：
+    - offset_origin：所有曲线偏置到 (0,0)（减各自首点）。
+    - shared_x_grid：多曲线 X 范围不一致时插值到公共 X 网格再画（避免轴崩）；
+      offset_origin 时默认也走公共网格。grid_step 可指定网格分辨率。
+    - line_width：统一曲线宽度(pt)。
+    - ref_step：沿 ref_axis 以该步长画参考虚线（如 x=2,4,6...）。"""
     session.ensure_connected()
     return session.plot_create(book=book, x_col=x_col, y_cols=y_cols,
                                plot_type=plot_type, template=template,
                                graph_name=graph_name, pairs=pairs,
-                               err_cols=err_cols)
+                               err_cols=err_cols, offset_origin=offset_origin,
+                               shared_x_grid=shared_x_grid,
+                               line_width=line_width, ref_step=ref_step,
+                               ref_axis=ref_axis, ref_dash=ref_dash,
+                               ref_color=ref_color, ref_width=ref_width,
+                               grid_step=grid_step)
 
 
 @mcp.tool()

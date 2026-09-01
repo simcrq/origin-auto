@@ -14,7 +14,7 @@
 Agent（Claude / opencode / Codex）
         │ MCP 协议 (stdio)
         ▼
-origin_mcp_server.py  ←—— 25 个工具
+origin_mcp_server.py  ←—— 27 个工具
         │ COM 自动化
         ▼
 Origin64.exe（本机 Origin，图形界面可见）
@@ -156,7 +156,7 @@ Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
 
 ---
 
-## 5. 工具总表（25 个）
+## 5. 工具总表（27 个）
 
 | 类别 | 工具 | 一句话说明 |
 |---|---|---|
@@ -174,7 +174,9 @@ Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
 | 数据 | `worksheet_get_data` | 整表读回（核对/分析） |
 | 数据 | `worksheet_set_columns` | 列长名/单位/注释/类型(designation) |
 | 数据 | `worksheet_export_csv` | 活动表导出 CSV |
-| 绘图 | `plot_create` | 折线/散点/点线/柱状；支持误差棒（**返回实际图形名**） |
+| 数据 | `import_csv` | 领域无关地导入任意 CSV（表头→列名、自动数值强转、可指定 X/Y 列、溯源戳记）|
+| 数据 | `import_dataset` | 按 manifest.json 批量导入多个 CSV 并写 `import_log.json` 审计链（领域无关、可溯源）|
+| 绘图 | `plot_create` | 折线/散点/点线/柱状；支持误差棒；新增通用对齐（`offset_origin`/`shared_x_grid`）、`line_width`、`ref_step` 参考线（**返回实际图形名**）|
 | 格式 | `axis_get` | **读回轴真实范围/增量/刻度类型**（COM 通道，首选） |
 | 格式 | `axis_set` | 轴标题/范围/线性对数/刻度增量（给范围时**自动锁轴**） |
 | 格式 | `series_style` | 曲线颜色/线宽/符号（支持 y_col 定位；图不存在时返回可读错误） |
@@ -379,6 +381,70 @@ labtalk_evaluate("layer.x.from", window="Graph1")  # → 正确（先 win -a 再
 
 ---
 
+### 6.17 `import_csv(path, book_name=None, x_col=1, y_cols=None, provenance=None)` → 通用 CSV 导入
+
+领域无关地把任意 CSV 读入新工作簿：
+
+- 表头作为列 long-name；数值列经 `_coerce_cell` 自动强转 + `data_put` 的
+  `numerictype` 预格式化，**避免整列被存成文本**（早期 X 轴塌缩到 0–0.2 的根因修复）。
+- `x_col` / `y_cols` 指定列 designation（不指定则除 `x_col` 外全当 Y）。
+- `provenance` 字符串盖进工作簿 comment（`page.info(8)$`，best-effort）并随结果返回，
+  用于溯源；缺省为 `source=<文件名>`。
+- 返回 `{"ok", "book", "rows", "cols", "header", "provenance", "write_method"}`——
+  `book` 是 Origin 净化后的实际窗口名，后续调用用它。
+- ⚠️ **重数据处理（单位换算 / 平滑 / 拆分 / 插值）应在外部 Python 完成**，
+  只把成品 CSV 交给本工具。MCP 只负责「导入 + 绘图」，不做领域计算。
+
+### 6.18 `import_dataset(manifest_path)` → 批量导入 + 溯源
+
+领域无关：按 `manifest.json` 批量导入多个 CSV，并在**同目录**写 `import_log.json`
+审计链，使每个结果工作簿都可回溯到源文件与处理说明。
+
+manifest 结构：
+
+```json
+{
+  "name": "8.27 carbon",
+  "description": "拉拔力-位移，单位已转 N，窗长500平滑",
+  "items": [
+    {"csv": "processed/depth06.csv", "book_name": "D06",
+     "x_col": 1, "y_cols": [2], "provenance": "smooth window=500 step=1"},
+    {"csv": "processed/depth09.csv", "book_name": "D09",
+     "x_col": 1, "y_cols": [2], "provenance": "smooth window=500 step=1"}
+  ]
+}
+```
+
+- `csv` 路径**相对 manifest 目录**解析（也接受绝对路径）。
+- 每个 `item` 调 `import_csv`；`provenance` 缺省时回退到 manifest 的 `description`。
+- 完成后写 `import_log.json` =
+  `{"dataset": <name>, "log": {<book>: {"source", "provenance", "imported_at"}}}`。
+- 返回 `{"ok", "imported", "total", "results": [...], "import_log": <路径>}`。
+
+### 6.19 `plot_create` 的通用对齐参数（可选，不替代外部处理）
+
+`plot_create` 新增一组与领域无关的可选参数，解决「多曲线起点 / 量程不一致」时的
+轻量展示对齐：
+
+| 参数 | 作用 |
+|---|---|
+| `offset_origin` | 所有曲线偏置到 (0,0)（各减自身首点），便于不同试件 / 工况对齐起点 |
+| `shared_x_grid` | 多曲线 X 范围不一致时，插值到公共 X 网格再画（否则 plotxy 共用 X 列会把轴拉崩）|
+| `grid_step` | 公共网格分辨率（默认取最小间距或 0.01）|
+| `line_width` | 统一设曲线线宽(pt)，省去逐条 `series_style` |
+| `ref_step` | 沿 `ref_axis` 以该步长画参考虚线（如 `ref_step=2` → x=2,4,6…）|
+| `ref_axis` / `ref_dash` / `ref_color` / `ref_width` | 参考线轴别、虚线、颜色索引、线宽 |
+
+机制：当 `offset_origin or shared_x_grid`（且非 `pairs` 模式）时，内部先调
+`_build_aligned_book`——把所有曲线按各自首点偏置到 (0,0)，再线性插值到公共 X 网格，
+写入 `*_align` 新工作簿，然后递归对对齐簿绘图，自动套用 `line_width` 与 `ref_step`
+参考线。返回里多带 `aligned_book`、`xmax`。
+
+> ⚠️ 对齐只解决「起点 / 量程不一致」的**展示**对齐，**不替代**外部的数据处理
+> （单位换算、平滑、降采样等仍应在 Python 侧完成，再 `import_csv` 进 Origin）。
+
+---
+
 ## 7. 典型工作流（照抄即可）
 
 以下"伪代码"展示 Agent 实际的工具调用序列。**你只需要对 Agent 说自然语言**，
@@ -480,6 +546,36 @@ axis_get("Fig1", "x")                  # 读 X 轴范围（首选，COM 通道�
 labtalk_evaluate("wks.ncols", window="Data1")  # 工作簿列数（带 window）
 pages_list()                           # 当前打开的所有窗口
 ```
+
+### 7.7 数据集批量导入 + 对齐绘图（推荐：重处理外部，导入仅绘图）
+
+**原则**：单位换算 / 平滑 / 拆分 / 插值全部在外部 Python 完成，产出成品 CSV；
+MCP 只负责把 CSV 导入 Origin 并绘图。这样处理过程可追溯、可复跑。
+
+```text
+用户："按 manifest.json 把 8.27 碳的三组深度数据导入 Origin，
+       偏置到起点对齐画点线图，线宽 1.5，每 2 单位画参考虚线"
+```
+
+```python
+origin_status()                                          # ① 环境确认
+origin_connect(visible=True)                             # ② 连接
+import_dataset("G:/8.27碳/processed/manifest.json")       # ③ 批量导入 + 写 import_log.json
+#   → 返回各 book 名（D06 / D09 / D12）与溯源日志路径
+plot_create("D06", x_col=1, y_cols=[2],                  # ④ 对齐绘图
+            plot_type="line_symbol", graph_name="G06",
+            offset_origin=True, shared_x_grid=True,
+            line_width=1.5, ref_step=2)
+plot_create("D09", x_col=1, y_cols=[2],
+            plot_type="line_symbol", graph_name="G09",
+            offset_origin=True, shared_x_grid=True,
+            line_width=1.5, ref_step=2)
+# ... 逐组导出 / 保存
+graph_export(r"G:\out\g06.png", graph="G06")
+project_save(r"G:\out\carbon_827.opju", backup=True)
+```
+
+`import_log.json` 落盘后即可复盘：每个工作簿 ← 哪个源 CSV ← 什么处理说明（provenance）。
 
 ---
 
