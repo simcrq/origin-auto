@@ -14,7 +14,7 @@
 Agent（Claude / opencode / Codex）
         │ MCP 协议 (stdio)
         ▼
-origin_mcp_server.py  ←—— 27 个工具
+origin_mcp_server.py  ←—— 28 个工具
         │ COM 自动化
         ▼
 Origin64.exe（本机 Origin，图形界面可见）
@@ -156,7 +156,7 @@ Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
 
 ---
 
-## 5. 工具总表（27 个）
+## 5. 工具总表（28 个）
 
 | 类别 | 工具 | 一句话说明 |
 |---|---|---|
@@ -179,6 +179,7 @@ Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
 | 绘图 | `plot_create` | 折线/散点/点线/柱状；支持误差棒；新增通用对齐（`offset_origin`/`shared_x_grid`）、`line_width`、`ref_step` 参考线（**返回实际图形名**）|
 | 格式 | `axis_get` | **读回轴真实范围/增量/刻度类型**（COM 通道，首选） |
 | 格式 | `axis_set` | 轴标题/范围/线性对数/刻度增量（给范围时**自动锁轴**） |
+| 格式 | `set_axis_origin` | 让两条轴线在 (0,0) 相交（修自动边距导致的"原点在 (0,-2)"）|
 | 格式 | `series_style` | 曲线颜色/线宽/符号（支持 y_col 定位；图不存在时返回可读错误） |
 | 格式 | `graph_frame` | 边框开关（上/右轴线） |
 | 格式 | `text_label` | 文本标注 |
@@ -442,6 +443,59 @@ manifest 结构：
 
 > ⚠️ 对齐只解决「起点 / 量程不一致」的**展示**对齐，**不替代**外部的数据处理
 > （单位换算、平滑、降采样等仍应在 Python 侧完成，再 `import_csv` 进 Origin）。
+
+### 6.20 `set_axis_origin(graph, x0=0.0, y0=0.0, x1=None, y1=None)` → 轴范围从 (0,0) 开始
+
+把两条坐标轴的**范围起点**钉到 `(x0, y0)`（默认 `(0, 0)`），并锁定——
+图框的左下角就是数据原点。这是"原点在 (0,0) 而不是 (0,-2)"的正解：
+Origin 自动缩放会给轴加负边距（实测 Y 轴被推到 `-2`），本工具两条都
+清零。不传 `x1/y1` 时上界保持 Origin 当前的自动值。
+
+| 参数 | 含义 |
+|---|---|
+| `x0` / `y0` | 两条轴的起点，默认都是 0 |
+| `x1` / `y1` | 可选上界；不传则保持当前自动上界（不被改） |
+
+**⚠️ 与"轴线穿过 0"（atzero 交叉）是两件不同的事，常见混淆：**
+
+| 想要什么 | 用什么 | 后果 |
+|---|---|---|
+| **范围**从 (0,0) 开始（图框左下角 = 原点） | `set_axis_origin` | 低于原点的数据**被裁** |
+| 轴线**穿过** 0 而保留所有数据 | `labtalk_execute("win -a <图>; layer.x.atzero=1; layer.y.atzero=1; doc -uw; win -r; redraw; layer -r;")` | 视觉上像"多画两条 x=0, y=0 线" |
+
+数据含负值、又不想裁时，请用第二行的 atzero 路径。本工具会在检测到
+"当前起点低于目标原点"时返回 `warning` 提示裁剪风险，但**照常执行**。
+
+**Origin 2021 属性真相**（探测踩坑记录）：
+
+| 候选属性 | `GetNumProp` 读 | 能否用 |
+|---|---|---|
+| `x.cross` / `x.crossN` / `x.crossAt` | 全部返回 sentinel (`-1.23e-300`) | ❌ 不存在 |
+| `x.zeroline` / `x.at` / `x.axispos` | 全部返回 sentinel | ❌ 不存在 |
+| `x.position` | 0/1/2/3 整数 | ⚠️ 写入生效但视觉不动（缓存问题） |
+| **`x.atzero`** | **0.0 / 1.0** | ✅ atzero 路径用，但**不是**本工具的实现 |
+
+实测坑：
+- **必须 `layer.<ax>.rescale = 0` 锁定**——否则 Origin 自动边距会在后续任何重绘
+  时把手动范围改回去。
+- **必须强刷** `doc -uw; win -r; redraw; layer -r;`——只设属性不刷，`graph_export`
+  抓到的是旧帧（readback 看起来对、PNG 不变，极迷惑）。本工具已自动包含强刷。
+
+```python
+# 典型：让 X/Y 都从 0 开始，上界保持自动
+set_axis_origin("Fig1")                  # 默认 (0,0)
+
+# 数据范围已知时显式锁两端
+set_axis_origin("Fig1", x0=0, y0=0, x1=10, y1=25)
+
+# 数据含负值、不想被裁——改用 atzero 路径
+labtalk_execute("win -a Fig1; layer.x.atzero=1; layer.y.atzero=1; "
+                "doc -uw; win -r; redraw; layer -r;")
+```
+
+**返回**：`{ok, graph, x0, y0, before, after, warning?}`。`ok=True` 以
+**读回** `x.from == x0` 且 `y.from == y0` 为唯一标准，`before/after` 是
+完整的 `{x.from, x.to, y.from, y.to}` 范围快照，方便核对。
 
 ---
 

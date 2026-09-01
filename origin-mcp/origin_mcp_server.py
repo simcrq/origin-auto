@@ -1421,6 +1421,87 @@ class OriginSession:
             res["actual"] = {"from": read.get("from"), "to": read.get("to")}
         return res
 
+    def set_axis_origin(self, graph: str, x0: float = 0.0, y0: float = 0.0,
+                        x1: float | None = None, y1: float | None = None) -> dict:
+        """让坐标轴【范围】从 (x0, y0) 开始（默认 (0,0)）——图框左下角就是数据原点。
+
+        这才是"原点在 (0,0) 而不是 (0,-2)"的正解：Origin 自动缩放会给轴加
+        负边距（实测 Y 轴被推到 -2），本工具把两条轴的 from 显式钉到 x0/y0
+        并锁定，图框左下角即 (x0, y0)。不给 x1/y1 时上界保持 Origin 当前的
+        自动值不变。
+
+        与"轴线穿过 0"（atzero 交叉）是两件不同的事：
+          - 本工具改【范围】：图框左下角 = (0,0)。代价是低于原点的负值会被裁掉
+          - atzero  改【轴线画在哪】：所有数据仍可见，轴线在中间穿过 0，
+            视觉上像"多画了两条线"
+        数据含负值且不想裁时，别用本工具，改用 atzero 路径：
+          labtalk_execute("win -a <图>; layer.x.atzero=1; layer.y.atzero=1; "
+                          "doc -uw; win -r; redraw; layer -r;")
+
+        实测踩坑：
+          - 必须 layer.<ax>.rescale=0 锁定，否则后续任何重绘都会把手动范围改回去
+          - 必须 doc -uw; win -r; redraw; layer -r; 强刷，否则导出 PNG 抓到旧帧
+          - 属性真相：x.cross / x.crossN / x.crossAt / x.zeroline / x.at 全是
+            GetNumProp 无效属性（返回 sentinel -1.23e-300），只有 x.atzero 可用
+        """
+        g = self._resolve_page(graph, "graph")
+        gl = self._find_graph_layer(g)
+        if gl is None:
+            return {"ok": False, "graph": g,
+                    "error": f"找不到图形窗口或图层 {g}",
+                    "graphs": self._graph_names()}
+
+        def _read_range():
+            out: dict = {}
+            for ax in ("x", "y"):
+                for p in ("from", "to"):
+                    try:
+                        v = float(gl.GetNumProp(f"{ax}.{p}"))
+                        out[f"{ax}.{p}"] = v
+                    except Exception:  # noqa: BLE001
+                        out[f"{ax}.{p}"] = None
+            return out
+
+        before = self.safe_op(
+            lambda: self.worker.submit(_read_range, timeout=30)) or {}
+        # 预警：当前起点低于目标原点 => 负值部分会被裁掉
+        clipped = []
+        for ax, lo in (("x", x0), ("y", y0)):
+            cur = before.get(f"{ax}.from")
+            if isinstance(cur, (int, float)) and not _is_nanum(cur) \
+                    and cur < lo - 1e-9:
+                clipped.append(f"{ax} 轴原起点 {cur:g} 低于 {lo:g}，"
+                               f"负值部分会被裁掉")
+        lines = [f"win -a {g};",
+                 f"layer.x.from = {float(x0)};",
+                 f"layer.y.from = {float(y0)};"]
+        if x1 is not None:
+            lines.append(f"layer.x.to = {float(x1)};")
+        if y1 is not None:
+            lines.append(f"layer.y.to = {float(y1)};")
+        lines.append("layer.x.rescale = 0; layer.y.rescale = 0;")
+        self.ex("\n".join(lines))
+        self.ex(f"win -a {g}; doc -uw; win -r; redraw; layer -r;")
+        # 回读校验：以 from 真的变成 x0/y0 为唯一成功标准
+        after = self.safe_op(
+            lambda: self.worker.submit(_read_range, timeout=30)) or {}
+
+        def _close(a, b):
+            return (isinstance(a, (int, float)) and isinstance(b, (int, float))
+                    and not _is_nanum(a) and abs(a - b) < 1e-6)
+
+        verified = _close(after.get("x.from"), x0) and _close(
+            after.get("y.from"), y0)
+        res: dict = {"ok": bool(verified), "graph": g, "x0": x0, "y0": y0,
+                     "before": before, "after": after}
+        if clipped:
+            res["warning"] = ("；".join(clipped)
+                              + "。若需保留负值：改用 axis_set 给 vmin 留余量，"
+                                "或用 atzero 让轴线穿过 0 而不裁数据（见 docstring）")
+        if g != _clean_text(graph):
+            res["resolved_from"] = _clean_text(graph)
+        return res
+
     def series_style(self, graph: str, series_index: int = 1,
                      color: str | None = None, line_width_pt: float | None = None,
                      symbol_size: float | None = None,
@@ -2047,6 +2128,32 @@ def axis_set(graph: str, axis: str = "x", title: str | None = None,
     return session.axis_set(graph=graph, axis=axis, title=title, vmin=vmin,
                             vmax=vmax, scale=scale,
                             major_increment=major_increment, rescale=rescale)
+
+
+@mcp.tool()
+def set_axis_origin(graph: str, x0: float = 0.0, y0: float = 0.0,
+                    x1: float | None = None, y1: float | None = None) -> dict:
+    """让两条坐标轴【范围】都从 (x0, y0) 开始——图框左下角就是数据原点。
+
+    这是"我要原点在 (0,0) 而不是 (0,-2)"的正解：Origin 自动缩放会给轴加
+    负边距，把两条轴的起点显式钉到 x0/y0 并锁定即可。
+
+    ⚠️ 与"让轴线穿过 0"是两回事：
+      - 本工具改【范围】：左下角 = (0,0)，代价是低于原点的负值被裁掉
+        （会返回 warning 提示）
+      - 若数据含负值、想保留全部数据又让轴线过 0，改用 atzero 路径：
+        labtalk_execute("win -a <图>; layer.x.atzero=1; layer.y.atzero=1; "
+                        "doc -uw; win -r; redraw; layer -r;")
+
+    参数：x0/y0 = 两条轴的起点（默认均 0）；x1/y1 = 可选上界，不给则
+    保持 Origin 当前自动上界。
+
+    实测坑：x.cross / x.crossN / x.crossAt / x.zeroline / x.at 全是
+    GetNumProp 无效属性（sentinel -1.23e-300），别用；只设属性不刷新的话
+    导出 PNG 会抓到旧帧——本工具内部已自动强刷。
+    """
+    session.ensure_connected()
+    return session.set_axis_origin(graph=graph, x0=x0, y0=y0, x1=x1, y1=y1)
 
 
 @mcp.tool()

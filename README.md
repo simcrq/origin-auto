@@ -8,7 +8,7 @@ MCP 工具，再配一层 WorkBuddy 自然语言技能，让 "用 Origin 画 XX 
 
 | 目录 | 是什么 | 给谁用 |
 |---|---|---|
-| [`origin-mcp/`](./origin-mcp) | MCP 服务端（`origin_mcp_server.py`，25 个工具），通过 COM 自动化本机 Origin | 任意支持 MCP 的 Agent（Claude / opencode / Codex） |
+| [`origin-mcp/`](./origin-mcp) | MCP 服务端（`origin_mcp_server.py`，28 个工具），通过 COM 自动化本机 Origin | 任意支持 MCP 的 Agent（Claude / opencode / Codex） |
 | [`origin-auto-skill/`](./origin-auto-skill) | WorkBuddy 技能（自然语言触发层），未注册 MCP 时回退到独立脚本 `quick_plot.py` | WorkBuddy 用户 |
 
 两者共享同一套 COM 自动化经验，完整坑点记录在
@@ -25,7 +25,7 @@ MCP 工具，再配一层 WorkBuddy 自然语言技能，让 "用 Origin 画 XX 
 Agent ── 选 origin-auto-skill 触发 MCP 工具链
         │ MCP 协议 (stdio)
         ▼
-origin_mcp_server.py  ←—— 25 个工具（连接/数据/绘图/坐标轴/样式/参考线/导出/保存）
+origin_mcp_server.py  ←—— 28 个工具（连接/数据/绘图/坐标轴/坐标轴原点/样式/参考线/导出/保存）
         │ COM 自动化
         ▼
 Origin64.exe（本机 Origin，图形界面可见）
