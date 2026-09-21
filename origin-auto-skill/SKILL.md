@@ -37,6 +37,23 @@ description: >-
 `scripts/quick_plot.py` 与 MCP 走同一套 COM 封装（`scripts/origin_session.py`），
 已用 12977 行真实 CSV 实测通过，不是未验证的占位代码。
 
+## 并发与超时（必须串行）
+
+Origin 是单实例 STA，COM 调用不会并行。**同一会话一次只调用一个有状态工具**，
+不要并发发送绘图、激活窗口、参考线、导出或保存请求，也不要把 `win -a` 与后续
+`layer.*` 读取拆成可交错的并行工具调用。
+
+- MCP 服务端实行单飞：并发请求返回 `busy=true, not_executed=true`，表示本次没有
+  入队、没有副作用。等待当前调用完成后再继续。
+- 排队任务超时会在执行前取消；已经开始的 COM 调用无法安全取消，服务端会等待
+  真实结果，不会先报失败再在后台继续修改 Origin。
+- 若客户端/传输先超时或报“连接关闭”，**不代表 Origin 进程或工程已丢失**。
+  重连 `ApplicationSI`，先调用 `pages_list` 枚举现状，再只补建缺失结果；不要盲目
+  重试 `plot_create`、`add_ref_line`、`graph_export`、`project_save` 等副作用操作。
+- 不要用 `taskkill Origin64.exe` 处理并发超时；这会丢失未保存工程。
+
+故障机理与恢复细节见 `references/com_pitfalls.md` 的“8.8 并发、超时与恢复”。
+
 ## MCP 工作流（标准 8 步）
 
 ```
@@ -142,6 +159,7 @@ python <skill目录>/scripts/quick_plot.py `
 | **14** | **`axis_set(vmin=0)` 后仍出现自动边距**：Origin 会自动重缩放把范围改回去 | 设 vmin/vmax 时工具自动加 `layer.*.rescale=0` 锁定 |
 | **15** | **参考线**：`draw -l` 在 COM 下命名错乱/坐标丢失；两点数据图 hack 会进图例 + 触发轴缩放 | 用原生 `add_ref_line`（`layer.{axis}.refline#`），不进图例、不缩放、不写数据表 |
 | **16** | **会话假死导致空工程覆盖**：pages_list 返回 [] 时保存会用 0.6KB 空工程覆盖 6.9MB 成果 | `project_save` 默认拒绝；覆盖前留 `.bak`，体积骤降会告警 |
+| **17** | **并发是假并发**：排队超时后重试会重复副作用，活动窗口交错会静默读错图层 | 一次只调用一个有状态工具；`busy=true` 表示未执行；外部超时后重连并先 pages_list 核对，勿盲目重放 |
 
 完整版见 `references/com_pitfalls.md`。
 

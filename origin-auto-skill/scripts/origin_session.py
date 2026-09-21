@@ -85,6 +85,7 @@ class ComWorker:
         self._q = queue.Queue()
         self._t = None
         self._ready = threading.Event()
+        self._busy = threading.Event()
 
     def start(self):
         if self._t and self._t.is_alive():
@@ -101,17 +102,32 @@ class ComWorker:
             fn, fut = self._q.get()
             if fn is None:
                 break
+            if not fut.set_running_or_notify_cancel():
+                continue
+            self._busy.set()
             try:
                 fut.set_result(fn())
             except BaseException as exc:
                 fut.set_exception(exc)
+            finally:
+                self._busy.clear()
         pythoncom.CoUninitialize()
 
     def submit(self, fn, timeout=60.0):
         self.start()
         fut = concurrent.futures.Future()
         self._q.put((fn, fut))
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            if fut.cancel():
+                raise TimeoutError(
+                    f"COM 任务排队超过 {timeout:g}s，已取消且不会执行") from exc
+            return fut.result()
+
+    @property
+    def busy(self):
+        return self._busy.is_set()
 
     def stop(self):
         if self._t and self._t.is_alive():

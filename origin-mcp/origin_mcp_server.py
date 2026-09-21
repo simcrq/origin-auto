@@ -54,6 +54,7 @@ import shutil
 import sys
 import threading
 import time
+from functools import wraps
 from datetime import datetime
 import concurrent.futures
 from pathlib import Path
@@ -85,6 +86,7 @@ class ComWorker:
         self._tasks: "queue.Queue[tuple]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
+        self._busy = threading.Event()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -103,10 +105,17 @@ class ComWorker:
             fn, fut = self._tasks.get()
             if fn is None:
                 break
+            # submit() 超时后会取消仍在排队的 Future。必须在执行前认领，
+            # 否则客户端已经得到失败结果，副作用却仍会在后台发生。
+            if not fut.set_running_or_notify_cancel():
+                continue
+            self._busy.set()
             try:
                 fut.set_result(fn())
             except BaseException as exc:  # noqa: BLE001
                 fut.set_exception(exc)
+            finally:
+                self._busy.clear()
         pythoncom.CoUninitialize()
 
     def stop(self) -> None:
@@ -117,7 +126,20 @@ class ComWorker:
         self.start()
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._tasks.put((fn, fut))
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            if fut.cancel():
+                raise TimeoutError(
+                    f"COM 任务排队超过 {timeout:g}s，已取消且不会执行") from exc
+            # COM 调用一旦开始就无法安全取消。继续等待真实结果，避免上层把
+            # “仍在执行”误判为失败并自动重试同一副作用。
+            log.warning("COM 任务执行超过 %.1fs；已开始的调用不可取消，继续等待", timeout)
+            return fut.result()
+
+    @property
+    def busy(self) -> bool:
+        return self._busy.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +1982,37 @@ except ImportError:  # pragma: no cover
     from mcp.server.fastmcp import FastMCP as _FastMCP      # mcp 1.x  # noqa: N813
 
 session = OriginSession()
+_TOOL_OPERATION_LOCK = threading.Lock()
+
+
+def _origin_single_flight(fn):
+    """Origin 是单实例 STA：MCP 工具只允许一个有状态操作在途。"""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not _TOOL_OPERATION_LOCK.acquire(blocking=False):
+            return {
+                "ok": False,
+                "busy": True,
+                "not_executed": True,
+                "error": "Origin 正在执行另一个操作；本次调用未入队、未执行。"
+                         "请等待前一调用完成，再用 pages_list 核对状态；"
+                         "不要并发重试绘图、参考线、导出或保存。",
+            }
+        try:
+            if session.worker.busy:
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "not_executed": True,
+                    "error": "Origin COM 线程仍在执行先前调用；本次调用未执行。"
+                             "请稍后先用 pages_list 核对状态。",
+                }
+            return fn(*args, **kwargs)
+        finally:
+            _TOOL_OPERATION_LOCK.release()
+
+    return wrapped
+
 
 mcp = _FastMCP(
     "origin-mcp",
@@ -1972,6 +2025,7 @@ mcp = _FastMCP(
         "如 Data_0.6 -> Data06），workbook_new/plot_create 返回的是回读到的"
         "实际名，后续调用一律使用返回值里的名字。"
         "读坐标轴范围用 axis_get，不要用 labtalk_evaluate('layer.x.from')。"
+        "Origin COM 不支持并发；一次只调用一个有状态工具，busy=true 表示本次未执行。"
     ),
 )
 
@@ -1983,6 +2037,7 @@ def origin_status() -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def origin_connect(visible: bool = True) -> dict:
     """连接（必要时启动）Origin 并保持长驻会话。首次启动需等待加载。"""
     session.visible = visible
@@ -1990,6 +2045,7 @@ def origin_connect(visible: bool = True) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def origin_disconnect() -> dict:
     """断开 MCP 与 Origin 的 COM 会话（不关闭 Origin 程序本身）。"""
     session.invalidate()
@@ -1997,6 +2053,7 @@ def origin_disconnect() -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def project_new() -> dict:
     """新建空白 Origin 工程。注意：当前工程中未保存的内容会丢失，调用前应提醒用户。"""
     session.ensure_connected()
@@ -2004,6 +2061,7 @@ def project_new() -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def workbook_new(name: str | None = None, sheets: int = 1) -> dict:
     """新建工作簿并按 name 命名（自动去重），返回**实际**窗口名。
 
@@ -2015,6 +2073,7 @@ def workbook_new(name: str | None = None, sheets: int = 1) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def worksheet_set_columns(book: str, columns: list[dict]) -> dict:
     """设置列属性。columns 元素形如 {"index":1,"name":"Time","units":"s","comments":"...","type":"x"}；
     type 可选 x/y/z/xerr/yerr/label/none，index 从 1 开始。"""
@@ -2023,6 +2082,7 @@ def worksheet_set_columns(book: str, columns: list[dict]) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def data_put(book: str, data: list[list], start_row: int = 1,
              start_col: int = 1, header: list[str] | None = None) -> dict:
     """向工作簿活动表批量写入二维数组（数字或字符串混合），start_row/start_col 从 1 起。
@@ -2036,6 +2096,7 @@ def data_put(book: str, data: list[list], start_row: int = 1,
 
 
 @mcp.tool()
+@_origin_single_flight
 def import_csv(path: str, book_name: str | None = None,
                x_col: int = 1, y_cols: list[int] | None = None,
                provenance: str | None = None) -> dict:
@@ -2050,6 +2111,7 @@ def import_csv(path: str, book_name: str | None = None,
 
 
 @mcp.tool()
+@_origin_single_flight
 def import_dataset(manifest_path: str) -> dict:
     """按 manifest.json 批量导入数据集并写 import_log.json 溯源（领域无关）。
 
@@ -2061,6 +2123,7 @@ def import_dataset(manifest_path: str) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def worksheet_get_data(book: str) -> dict:
     """读回工作簿活动表的全部数据（用于核对写入结果或分析）。"""
     session.ensure_connected()
@@ -2068,6 +2131,7 @@ def worksheet_get_data(book: str) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def plot_create(book: str, x_col: int = 1, y_cols: list[int] | None = None,
                 plot_type: str | int = "line_symbol",
                 template: str | None = None, graph_name: str | None = None,
@@ -2104,6 +2168,7 @@ def plot_create(book: str, x_col: int = 1, y_cols: list[int] | None = None,
 
 
 @mcp.tool()
+@_origin_single_flight
 def axis_get(graph: str, axis: str = "x") -> dict:
     """读回坐标轴真实范围/增量/刻度类型（from/to/increment/scale）。
 
@@ -2115,6 +2180,7 @@ def axis_get(graph: str, axis: str = "x") -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def axis_set(graph: str, axis: str = "x", title: str | None = None,
              vmin: float | None = None, vmax: float | None = None,
              scale: str | None = None, major_increment: float | None = None,
@@ -2131,6 +2197,7 @@ def axis_set(graph: str, axis: str = "x", title: str | None = None,
 
 
 @mcp.tool()
+@_origin_single_flight
 def set_axis_origin(graph: str, x0: float = 0.0, y0: float = 0.0,
                     x1: float | None = None, y1: float | None = None) -> dict:
     """让两条坐标轴【范围】都从 (x0, y0) 开始——图框左下角就是数据原点。
@@ -2157,6 +2224,7 @@ def set_axis_origin(graph: str, x0: float = 0.0, y0: float = 0.0,
 
 
 @mcp.tool()
+@_origin_single_flight
 def series_style(graph: str, series_index: int = 1, color: str | None = None,
                  line_width_pt: float | None = None,
                  symbol_size: float | None = None,
@@ -2174,6 +2242,7 @@ def series_style(graph: str, series_index: int = 1, color: str | None = None,
 
 
 @mcp.tool()
+@_origin_single_flight
 def text_label(text: str, name: str = "mcpLabel", x: float | None = None,
                y: float | None = None, font_size: int | None = None,
                graph: str | None = None) -> dict:
@@ -2184,6 +2253,7 @@ def text_label(text: str, name: str = "mcpLabel", x: float | None = None,
 
 
 @mcp.tool()
+@_origin_single_flight
 def graph_export(filepath: str, fmt: str | None = None, graph: str | None = None) -> dict:
     """导出图为图片，格式由扩展名或 fmt 决定：png/pdf/eps/tif/jpg/emf。
     分辨率取 Origin 默认导出设置（通常 300dpi 级别）。返回前校验文件真实生成。"""
@@ -2192,6 +2262,7 @@ def graph_export(filepath: str, fmt: str | None = None, graph: str | None = None
 
 
 @mcp.tool()
+@_origin_single_flight
 def worksheet_export_csv(filepath: str, book: str | None = None) -> dict:
     """把工作簿活动表导出为 CSV 文件。"""
     session.ensure_connected()
@@ -2199,6 +2270,7 @@ def worksheet_export_csv(filepath: str, book: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def pages_list() -> dict:
     """列出当前打开的工作簿与图形窗口名。"""
     session.ensure_connected()
@@ -2206,6 +2278,7 @@ def pages_list() -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def page_activate(name: str) -> dict:
     """按窗口名激活工作簿或图形页面，返回值含激活结果校验。"""
     session.ensure_connected()
@@ -2213,6 +2286,7 @@ def page_activate(name: str) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def project_save(path: str, force: bool = False, backup: bool = True) -> dict:
     """保存工程为 .opju/.opj（路径需为绝对路径）。返回值含文件存在性与大小校验。
 
@@ -2224,6 +2298,7 @@ def project_save(path: str, force: bool = False, backup: bool = True) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def project_open(path: str) -> dict:
     """打开已有 Origin 工程(.opju/.opj)，path 需为绝对路径。"""
     session.ensure_connected()
@@ -2231,6 +2306,7 @@ def project_open(path: str) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def graph_frame(graph: str, boxed: bool = True) -> dict:
     """显示/隐藏图形边框（补全上/右轴线），boxed=true 为封闭边框。"""
     session.ensure_connected()
@@ -2238,6 +2314,7 @@ def graph_frame(graph: str, boxed: bool = True) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def add_ref_line(graph: str, axis: str = "x", pos: float = 0.0,
                  color: int = 1, width: float = 1.0, dash: bool = True,
                  label: str | None = None, book: str | None = None,
@@ -2254,6 +2331,7 @@ def add_ref_line(graph: str, axis: str = "x", pos: float = 0.0,
 
 
 @mcp.tool()
+@_origin_single_flight
 def legend_remove_last(graph: str, count: int = 1) -> dict:
     """删除图例最后 count 行（多余曲线/误差棒分组等条目）。
     必须在所有绘图与坐标轴操作全部完成之后调用，否则会被 Origin 重建恢复。
@@ -2263,6 +2341,7 @@ def legend_remove_last(graph: str, count: int = 1) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def labtalk_execute(script: str) -> dict:
     """直接执行任意 LabTalk 脚本（高级逃生舱）。只返回成功/失败；
     要读回数值请用 labtalk_evaluate。危险命令请优先用专用工具。"""
@@ -2271,6 +2350,7 @@ def labtalk_execute(script: str) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def labtalk_evaluate(expr: str, window: str | None = None) -> dict:
     """求值 LabTalk 表达式并返回数值/字符串结果。例："10*3"、"@V"(版本)。
     window 可选：求值前先 win -a 到该窗口。读 layer.* 时**必须**给 window，
@@ -2281,6 +2361,7 @@ def labtalk_evaluate(expr: str, window: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_origin_single_flight
 def quit_origin(force: bool = False) -> dict:
     """退出 Origin 程序。默认拒绝以防丢失未保存工作，须显式 force=true 且征得用户同意。"""
     session.ensure_connected()
