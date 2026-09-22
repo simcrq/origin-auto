@@ -4,7 +4,7 @@
 让 Claude / opencode / Codex 等 Agent 用自然语言完成：连接 Origin → 导入数据 →
 绘图 → 坐标轴/样式/边框/参考线/误差棒 → 导出图片 → 保存 `.opju` 工程。
 
-**已在 Origin 2021 (9.85, Windows 10/11) 全链路实测**：端到端测试 15/15 通过，
+**已在 Origin 2021 (9.8002, Windows 10/11) 全链路实测**：基础端到端验收共 15 步，
 并完成真实科研数据（CarbonFiber 力-位移曲线，15 个试件）的完整出图验证。
 
 ```
@@ -31,6 +31,7 @@ Origin64.exe（本机 Origin，图形界面可见）
 3. [注册到 Agent 客户端](#3-注册到-agent-客户端)
 4. [快速验证](#4-快速验证)
 5. [工具总表](#5-工具总表)
+   - [并发、超时与恢复](#51-并发超时与恢复)
 6. [工具详细说明](#6-工具详细说明)
 7. [典型工作流（照抄即可）](#7-典型工作流照抄即可)
 8. [速查表（颜色/线型/列类型/绘图类型）](#8-速查表)
@@ -47,7 +48,7 @@ Origin64.exe（本机 Origin，图形界面可见）
 | 操作系统 | Windows 10/11 | COM 自动化仅限 Windows |
 | OriginLab Origin | 2017+ 推荐（2021 实测） | 需完成过一次手动启动与许可验证 |
 | Python | 3.9+（3.12 实测） | 64 位 |
-| Python 包 | `mcp`、`pywin32`；可选 `openpyxl` | 见 requirements.txt |
+| Python 包 | `mcp`、`pywin32`、`openpyxl` | 见 requirements.txt；Excel 导入才会用到 openpyxl |
 | Agent 客户端 | opencode / Claude Desktop / Codex CLI 任一 | 用于注册 MCP |
 
 ## 2. 安装（三步）
@@ -196,6 +197,21 @@ Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
 > Origin 实际采用的 `Data06`。但推荐直接用 `workbook_new`/`plot_create`
 > 返回的实际名。
 
+### 5.1 并发、超时与恢复
+
+Origin 是单实例 STA，COM 调用不会并行。除只读的 `origin_status` 外，服务端对
+所有 MCP 工具实行单飞：同一时间只允许一个有状态调用进入 Origin。
+
+- 并发请求返回 `{"ok": false, "busy": true, "not_executed": true, ...}`，表示
+  本次请求没有入队、没有产生副作用；等待当前调用完成后再发起。
+- 排队中的 COM 任务若超时，会在开始执行前取消；已经开始的 COM 调用无法安全
+  取消，服务端会等待真实结果，不会先返回超时再在后台继续修改 Origin。
+- 客户端或传输层先超时、报“连接关闭”时，不能据此判断 Origin 进程已经退出。
+  重新连接 `ApplicationSI`，先调用 `pages_list` 枚举实际状态，再只补建缺失结果。
+- 不要并发拆开 `page_activate`/`win -a` 与后续 `layer.*` 读取；活动窗口是全局状态。
+- 不要盲目重试 `plot_create`、`add_ref_line`、`graph_export`、`project_save`，也不要
+  用 `taskkill Origin64.exe` 处理超时。
+
 ---
 
 ## 6. 工具详细说明
@@ -274,6 +290,15 @@ plot_create(
     graph_name=None,         # 图形窗口名（自动去重）
     pairs=[[1,2],[4,5]],     # XY 对模式：各 X 独立时用（与 y_cols 二选一）
     err_cols=[3, None],      # 与 pairs 对应的误差列号（None=该对无误差棒）
+    offset_origin=False,     # 各曲线减去首点，偏置到原点
+    shared_x_grid=False,     # 多曲线插值到公共 X 网格
+    line_width=None,         # 统一线宽（pt）
+    ref_step=None,           # 按固定步长添加原生参考线
+    ref_axis="x",          # 参考线所在轴
+    ref_dash=True,
+    ref_color=1,
+    ref_width=1.0,
+    grid_step=None,          # 公共 X 网格步长
 )
 ```
 
@@ -713,6 +738,8 @@ project_save(r"G:\out\carbon_827.opju", backup=True)
 | 图例删了又出现 | 裁剪时机不对；`legend_remove_last` 必须在所有操作后最后调用 |
 | 曲线样式不生效 | 用 `series_style` 的 `y_col` 参数定位；不要自己写 `set` 命令 |
 | MCP 启动超时 | 首次 gencache 生成类型库缓存较慢，第二次启动即恢复 |
+| 返回 `busy=true, not_executed=true` | 前一有状态调用仍在执行；本次未执行，等待后再调用 |
+| 调用超时或“连接关闭”但 Origin 仍在 | 重连同一 `ApplicationSI`，先 `pages_list` 核对现状，只补缺失结果，勿盲目重试或杀进程 |
 | Agent 找不到工具 | 确认注册后重启了客户端；`opencode` 里用 `/mcp` 查看状态 |
 
 ---
@@ -723,7 +750,9 @@ project_save(r"G:\out\carbon_827.opju", backup=True)
   `origin_connect` 使用 SI 单实例类，直接附着到已开实例
 - `quit_origin` 默认拒绝执行，须 `force=true` 且征得用户同意
 - `project_new` 会清空当前工程——Agent 调用前应先提醒用户保存
-- 所有输出写到用户指定路径；不删除/覆盖用户已有工程文件
+- `project_save` 覆盖已有工程前默认创建临时 `.bak`；若当前工程为空或保存后体积
+  异常缩水则拒绝/报警并保留备份。正常覆盖仍应先取得用户授权
+- 所有有状态 MCP 工具串行调用；收到 `busy=true` 时不得并发重试
 
 ---
 

@@ -1,7 +1,7 @@
 # origin-auto
 
 用 AI Agent 自动化驱动 OriginLab Origin 做科研绘图 —— 把 Origin 暴露成
-MCP 工具，再配一层 WorkBuddy 自然语言技能，让 "用 Origin 画 XX 曲线，出版级"
+MCP 工具，再配一层 Codex/Agent 自然语言技能，让 "用 Origin 画 XX 曲线，出版级"
 这种话直接变成可复现的出图。
 
 本仓库含两个强耦合的组件：
@@ -9,7 +9,7 @@ MCP 工具，再配一层 WorkBuddy 自然语言技能，让 "用 Origin 画 XX 
 | 目录 | 是什么 | 给谁用 |
 |---|---|---|
 | [`origin-mcp/`](./origin-mcp) | MCP 服务端（`origin_mcp_server.py`，28 个工具），通过 COM 自动化本机 Origin | 任意支持 MCP 的 Agent（Claude / opencode / Codex） |
-| [`origin-auto-skill/`](./origin-auto-skill) | WorkBuddy 技能（自然语言触发层），未注册 MCP 时回退到独立脚本 `quick_plot.py` | WorkBuddy 用户 |
+| [`origin-auto-skill/`](./origin-auto-skill) | Codex/Agent 技能（自然语言触发层），未注册 MCP 时回退到独立脚本 `quick_plot.py` | 使用技能机制的 Agent 用户 |
 
 两者共享同一套 COM 自动化经验，完整坑点记录在
 [`origin-auto-skill/references/com_pitfalls.md`](./origin-auto-skill/references/com_pitfalls.md)。
@@ -36,14 +36,15 @@ Origin64.exe（本机 Origin，图形界面可见）
 
 ## 组件一：origin-mcp（MCP 服务端）
 
-把 Origin 暴露为 25 个 MCP 工具，端到端实测 30/30 通过，并完成真实科研数据
+把 Origin 暴露为 28 个 MCP 工具，包含基础端到端验收、问题回归测试和无 Origin
+单元测试，并完成真实科研数据
 （CarbonFiber 15 试件力-位移曲线）的完整出图验证。
 
 **环境要求**
 
 - Windows 10/11（COM 自动化仅限 Windows）
 - OriginLab Origin 2017+（2021 实测），需完成过一次手动启动与许可验证
-- Python 3.9+（3.12 实测），包：`mcp`、`pywin32`（可选 `openpyxl`）
+- Python 3.9+（3.12 实测），包：`mcp`、`pywin32`、`openpyxl`
 
 **安装与注册**
 
@@ -71,25 +72,30 @@ python scripts\diagnose.py --com      # 真实 COM 连接自检（会启动 Orig
 
 ---
 
-## 组件二：origin-auto-skill（WorkBuddy 技能）
+## 组件二：origin-auto-skill（Codex/Agent 技能）
 
-WorkBuddy 技能。自然语言 "用 Origin 画图" 即自动选择上面的 MCP 工具链；
+自然语言 "用 Origin 画图" 即自动选择上面的 MCP 工具链；
 MCP 未注册时回退到独立脚本 `scripts/quick_plot.py`（同一套 COM 封装，可直接 CLI 跑）。
 
-**安装到 WorkBuddy**
+**安装技能**
 
-把 `origin-auto-skill/` 整个目录复制到 WorkBuddy 的技能目录：
+把 `origin-auto-skill/` 整个目录复制到用户级或项目级技能目录：
 
 ```powershell
-# 用户级（所有项目可用），推荐
-Copy-Item -Recurse origin-auto-skill C:\Users\<你>\.workbuddy\skills\origin-auto
+# Codex 用户级（所有项目可用）
+Copy-Item -Recurse origin-auto-skill C:\Users\<你>\.codex\skills\origin-auto
+
+# 项目级（仅当前仓库）
+Copy-Item -Recurse origin-auto-skill .agents\skills\origin-auto
 ```
 
-安装后在 WorkBuddy 里直接说 "用 Origin 画 XX"，技能会自动编排 MCP 调用；
+安装后直接说 "用 Origin 画 XX"，技能会自动编排 MCP 调用；
 或在没有 Origin/MCP 的环境用回退脚本：
 
 ```powershell
-python origin-auto-skill\scripts\quick_plot.py --csv data.csv --x 1 --y 2 --out out.png
+python origin-auto-skill\scripts\quick_plot.py `
+  --data data.csv --x-col 1 --y-cols 2 `
+  --export out.png --save out.opju
 ```
 
 技能内部知识库（颜色/线型/列类型/绘图类型速查、完整坑点）见
@@ -104,6 +110,10 @@ python origin-auto-skill\scripts\quick_plot.py --csv data.csv --x 1 --y 2 --out 
 - `quit_origin` 默认拒绝，须显式 `force=true` 且征得用户同意
 - `project_new` 会清空当前工程，调用前应先提醒用户保存
 - 所有导出/保存走工具内置校验，不轻信 Origin 的布尔返回值
+- Origin COM 是单实例 STA；所有有状态工具必须串行调用。`busy=true,
+  not_executed=true` 表示请求未执行，可等待后重试
+- 传输超时或“连接关闭”不代表 Origin 已退出；先重连并用 `pages_list` 核对，
+  不要盲目重放副作用操作，更不要 `taskkill Origin64.exe`
 
 ---
 

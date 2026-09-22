@@ -35,7 +35,10 @@ description: >-
 ```
 
 `scripts/quick_plot.py` 与 MCP 走同一套 COM 封装（`scripts/origin_session.py`），
-已用 12977 行真实 CSV 实测通过，不是未验证的占位代码。
+已用 12977 行真实 CSV 实测通过，并有 `tests/` 下的无 Origin 单元测试覆盖。
+复杂的多文件批处理可先在 Origin 外完成清洗、平滑和统计，再通过
+`OriginSession` 串行写入工作簿、绘图和保存工程；回退脚本必须使用已安装
+`pywin32` 的 Python（项目内存在时优先复用 `origin-mcp/.venv`）。
 
 ## 并发与超时（必须串行）
 
