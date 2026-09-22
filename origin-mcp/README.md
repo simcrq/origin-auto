@@ -55,7 +55,7 @@ Origin64.exe（本机 Origin，图形界面可见）
 
 ```powershell
 # ① 进入目录，创建独立虚拟环境（推荐，不污染系统 Python）
-cd G:\USTB2024\0_Project\origin-mcp
+cd "<REPO>\origin-mcp"
 python -m venv .venv
 
 # ② 安装依赖
@@ -76,13 +76,15 @@ python scripts\diagnose.py --com        # 真实 COM 连接测试（会启动 Or
 ## 3. 注册到 Agent 客户端
 
 `command`/`args` 一律使用**绝对路径**；用了 venv 就指向 venv 内的 python.exe。
+下文用 `<REPO>` 表示本仓库的绝对路径，`<DATA>`/`<OUT>` 表示数据/输出目录；
+使用前请替换为本机实际绝对路径，不要原样保留尖括号占位符。
 
 ### 3.1 opencode
 
 方式一（命令行一键注册）：
 
 ```powershell
-opencode mcp add origin -- G:\USTB2024\0_Project\origin-mcp\.venv\Scripts\python.exe G:\USTB2024\0_Project\origin-mcp\origin_mcp_server.py
+opencode mcp add origin -- "<REPO>\origin-mcp\.venv\Scripts\python.exe" "<REPO>\origin-mcp\origin_mcp_server.py"
 ```
 
 方式二（编辑 `~/.config/opencode/opencode.json` 或项目根 `opencode.json`）：
@@ -92,8 +94,8 @@ opencode mcp add origin -- G:\USTB2024\0_Project\origin-mcp\.venv\Scripts\python
   "mcp": {
     "origin": {
       "type": "local",
-      "command": ["G:\\USTB2024\\0_Project\\origin-mcp\\.venv\\Scripts\\python.exe",
-                   "G:\\USTB2024\\0_Project\\origin-mcp\\origin_mcp_server.py"],
+      "command": ["<REPO>\\origin-mcp\\.venv\\Scripts\\python.exe",
+                   "<REPO>\\origin-mcp\\origin_mcp_server.py"],
       "enabled": true
     }
   }
@@ -108,8 +110,8 @@ opencode mcp add origin -- G:\USTB2024\0_Project\origin-mcp\.venv\Scripts\python
 {
   "mcpServers": {
     "origin": {
-      "command": "G:\\USTB2024\\0_Project\\origin-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["G:\\USTB2024\\0_Project\\origin-mcp\\origin_mcp_server.py"]
+      "command": "<REPO>\\origin-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["<REPO>\\origin-mcp\\origin_mcp_server.py"]
     }
   }
 }
@@ -121,8 +123,8 @@ opencode mcp add origin -- G:\USTB2024\0_Project\origin-mcp\.venv\Scripts\python
 
 ```toml
 [mcp_servers.origin]
-command = 'G:\USTB2024\0_Project\origin-mcp\.venv\Scripts\python.exe'
-args = ['G:\USTB2024\0_Project\origin-mcp\origin_mcp_server.py']
+command = '<REPO>\origin-mcp\.venv\Scripts\python.exe'
+args = ['<REPO>\origin-mcp\origin_mcp_server.py']
 startup_timeout_sec = 120.0
 ```
 
@@ -149,7 +151,7 @@ python scripts\test_e2e.py
 
 ```text
 用 origin_status 检查 Origin 环境，然后连接 Origin，
-画一条正弦曲线（x=0~6，步长0.5），导出 PNG 到 D:\temp\test.png
+画一条正弦曲线（x=0~6，步长0.5），导出 PNG 到 <OUT>\test.png
 ```
 
 Agent 会依次调用 `origin_connect` → `workbook_new` → `data_put` →
@@ -373,7 +375,8 @@ Origin 会在后续操作（axis_set、导出等）时重建图例，提前删�
 
 ### 6.13 `project_save(path)` / `project_open(path)` / `project_new()`
 
-- `path` 必须**反斜杠绝对路径**（如 `G:\data\result.opju`），正斜杠静默失败
+- `path` 必须是替换占位符后的**反斜杠绝对路径**（如 `<OUT>\result.opju`）；
+  正斜杠路径可能静默失败
 - 保存返回 `{"ok", "path", "size"}`，文件已确认落盘
 - `project_new` 会丢弃当前工程未保存内容，调用前应征得用户同意
 
@@ -532,7 +535,7 @@ labtalk_execute("win -a Fig1; layer.x.atzero=1; layer.y.atzero=1; "
 ### 7.1 单条曲线：CSV → 出版级折线图
 
 ```text
-用户："把 D:\data\run1.csv 画成 Origin 力-位移曲线，X=位移列，Y=力列，导出 PNG"
+用户："把 <DATA>\run1.csv 画成 Origin 力-位移曲线，X=位移列，Y=力列，导出 PNG"
 ```
 
 ```python
@@ -546,8 +549,8 @@ axis_set("Fig1", "x", title="Displacement (mm)", vmin=0)
 axis_set("Fig1", "y", title="Load (N)")
 series_style("Fig1", y_col=2, color=4, line_width_pt=1.5)
 graph_frame("Fig1", boxed=True)                    # ⑥ 边框
-graph_export(r"D:\out\fig1.png", graph="Fig1")     # ⑦ 导出（已校验）
-project_save(r"D:\out\fig1.opju")                  # ⑧ 存档
+graph_export(r"<OUT>\fig1.png", graph="Fig1")       # ⑦ 导出（已校验）
+project_save(r"<OUT>\fig1.opju")                    # ⑧ 存档
 ```
 
 ### 7.2 多试件对比图（各自独立 X 列）
@@ -567,7 +570,7 @@ series_style("G06", y_col=6, color=3, line_width_pt=1.5)
 axis_set("G06", "x", title="Displacement (mm)", vmin=0)
 axis_set("G06", "y", title="Load (N)")
 graph_frame("G06", boxed=True)
-graph_export(r"D:\out\group06.png", graph="G06")
+graph_export(r"<OUT>\group06.png", graph="G06")
 ```
 
 ### 7.3 均值 ± 标准差曲线（误差棒）
@@ -585,7 +588,7 @@ series_style("Mean06", y_col=2, color=1, line_width_pt=1.5)
 graph_frame("Mean06", boxed=True)
 axis_set("Mean06", "x", title="Displacement (mm)", vmin=0)
 axis_set("Mean06", "y", title="Load (N)")
-graph_export(r"D:\out\mean06.png", graph="Mean06")
+graph_export(r"<OUT>\mean06.png", graph="Mean06")
 ```
 
 误差棒太密时，把 SD 列大部分单元格留空（`""`=缺失=不画），
@@ -606,15 +609,15 @@ graph_export(...)
 ### 7.5 修改已有工程
 
 ```text
-用户："打开 D:\result.opju，把 Fig1 的 Y 轴标题改成 Stress (MPa)，重新导出"
+用户："打开 <DATA>\result.opju，把 Fig1 的 Y 轴标题改成 Stress (MPa)，重新导出"
 ```
 
 ```python
-project_open(r"D:\result.opju")
+project_open(r"<DATA>\result.opju")
 page_activate("Fig1")                              # 或 pages_list() 查看名字
 axis_set("Fig1", "y", title="Stress (MPa)")
-graph_export(r"D:\out\fig1_new.png", graph="Fig1")
-project_save(r"D:\result.opju")                    # 覆盖前确认用户同意
+graph_export(r"<OUT>\fig1_new.png", graph="Fig1")
+project_save(r"<DATA>\result.opju")                # 覆盖前确认用户同意
 ```
 
 ### 7.6 读回数据 / 检查 Origin 状态
@@ -639,7 +642,7 @@ MCP 只负责把 CSV 导入 Origin 并绘图。这样处理过程可追溯、可
 ```python
 origin_status()                                          # ① 环境确认
 origin_connect(visible=True)                             # ② 连接
-import_dataset("G:/8.27碳/processed/manifest.json")       # ③ 批量导入 + 写 import_log.json
+import_dataset(r"<DATA>\processed\manifest.json")       # ③ 批量导入 + 写 import_log.json
 #   → 返回各 book 名（D06 / D09 / D12）与溯源日志路径
 plot_create("D06", x_col=1, y_cols=[2],                  # ④ 对齐绘图
             plot_type="line_symbol", graph_name="G06",
@@ -650,8 +653,8 @@ plot_create("D09", x_col=1, y_cols=[2],
             offset_origin=True, shared_x_grid=True,
             line_width=1.5, ref_step=2)
 # ... 逐组导出 / 保存
-graph_export(r"G:\out\g06.png", graph="G06")
-project_save(r"G:\out\carbon_827.opju", backup=True)
+graph_export(r"<OUT>\g06.png", graph="G06")
+project_save(r"<OUT>\carbon_827.opju", backup=True)
 ```
 
 `import_log.json` 落盘后即可复盘：每个工作簿 ← 哪个源 CSV ← 什么处理说明（provenance）。
@@ -764,6 +767,5 @@ project_save(r"G:\out\carbon_827.opju", backup=True)
 
 ## 实战案例
 
-`G:\USTB2024\0_Project\CarbonFiber\figures\` —— 15 个试件的力-位移曲线
-（分组对比图 + 均值±SD 误差棒图 + 参考虚线 + 边框），全部由本 MCP 工具链
-自动生成，OPJU 工程已保存可直接继续编辑。
+已用 CarbonFiber 的 15 个试件完成力-位移曲线实战验证（分组对比图 + 均值±SD
+误差棒图 + 参考虚线 + 边框），全部由本 MCP 工具链自动生成，OPJU 工程可继续编辑。
