@@ -5,10 +5,12 @@ __pycache__/
 .venv/
 venv/
 env/
+.codex/
 
 # ===== 测试输出（二进制 / 临时） =====
 **/test_output/
-
+测试数据1/
+.agents/
 # ===== Origin 软件目录（非项目代码） =====
 Origin/
 
